@@ -23,9 +23,10 @@ class Voronoi2D():
 
         self.event = event
 
-    def Update(self, step = 0.3, event_plt = None, target = []): 
+    def Update(self, step = 0.3, event = [], event_plt = None, target = None): 
 
-        if len(target) > 0 :
+        if len(event) > 0 :
+            self.event = event
             self.event_plt = event_plt
             for i in range(self.camera_num):
                 self.PTZs[i].targets = target
@@ -35,9 +36,16 @@ class Voronoi2D():
             ptz.FoV = np.zeros(self.size)
             ptz.ComputeFoV()
 
+        hold = False
+            
         for i in range(self.camera_num):
             self.PTZs[i].UpdateVoronoi([self.PTZs[j].FoV \
-                for j in range(len(self.PTZs)) if j != i])
+                for j in range(len(self.PTZs)) if j != i], self.event)
+            hold = self.PTZs[i].UpdateState(self.event, [self.PTZs[j].pos \
+                for j in range(self.camera_num) if j != i], \
+                [self.PTZs[j] for j in range(self.camera_num) if j != i], step)
+
+            hold = hold or hold
 
         sum = 0
         area = 0
@@ -51,14 +59,10 @@ class Voronoi2D():
                 cnt[self.PTZs[i].target_assigned] += 1
         # print("Covered Quality: ",sum)
         # print("Total Covered Area: ", area)        
+        
+        self.map.Update(map_plt, self.PTZs, self.event_plt)
 
-        self.map.Update(map_plt, self.PTZs, self.event_plt, target)
-
-        for i in range(self.camera_num):
-            self.PTZs[i].UpdateState([self.PTZs[j].pos \
-                for j in range(self.camera_num) if j != i], step)
-
-        return cnt
+        return hold, cnt
 
     def norm(self, arr):
         sum = 0
@@ -82,23 +86,43 @@ class Voronoi2D():
             self.translation_force = 0  # dynamics of positional changes
             self.perspective_force = 0  # dynamics of changing perspective direction
             self.alpha_dot = 0          # dynamics of zoom-in level
-            self.stage = 1              # 1: Free player 2: Occupied Player 3: Cooperative player
+            self.stage = 0              # 0: searching under unknown event 1: tracking with known event 2: coverage
             self.targets = targets
             self.target_assigned = -1
-            self.FoV = np.zeros(self.size)
+            self.FoV = np.zeros(size)
             self.Kv = Kv                # control gain for perspective control law toward voronoi cell
             self.Kvo = Kvo              # control gain for perspective control law toward overlap cell
             self.Ka = Ka                # control gain for zoom level control stems from voronoi cell
             self.Kao = Kao              # control gain for zoom level control stems from overlap cell
             self.Kp = Kp                # control gain for positional change toward voronoi cell 
-            self.event = np.zeros((self.size[0], self.size[1]))
+            self.top = 0
+            self.ltop = 0
+            self.rtop = 0
+            self.phe = []
+            self.found = True
 
-        def UpdateState(self, neighbors, step):
-            centroidal_forces = self.ComputeCentroidal(self.event)
+        def UpdateState(self, event, neighbors, neighborhoods, step):
+            # centroidal_force: positional force , rotational force, zoom
+            # if len(event) == 0:
+            #     self.stage = 0
+            # elif len(event) > 0 and self.stage == 0:
+            #     self.stage = 1
+            # else:
+            #     pass
+            # centroidal_forces, centroid = self.ComputeCentroidal(event)
+
+            self.TargetFound(neighborhoods)
+
+            if self.found == False:
+                self.stage = 0
+            elif self.found == True and self.stage == 0:
+                self.stage = 1
+
+            centroidal_forces = self.ComputeCentroidal(event)
 
             formation_force = self.FormationControl(neighbors)
             self.TargetAssignment()
-            control_input = self.CBF(centroidal_forces[0], formation_force, \
+            control_input = self.CBF(neighborhoods, centroidal_forces[0], formation_force, \
                                         centroidal_forces[1], stage = self.stage)
             
             self.pos += control_input[0]*step
@@ -106,34 +130,129 @@ class Voronoi2D():
             self.perspective /= self.norm(self.perspective)
             self.alpha = self.alpha + centroidal_forces[2]*step
 
-        def CBF(self, translational_force = 0, formation_force = 0, rotational_force = 0,\
+            if self.found:
+
+                return True
+
+        def CBF(self, neighborhoods, translational_force = 0, formation_force = 0, rotational_force = 0,\
                     coe = 0.8, stage = 1):
 
-            if stage == 2:
-                # td = np.asarray(self.targets[self.target_assigned][0]) - self.pos
-                # td = td/self.norm(td)
+            if stage == 0:
+                
+                # random walk searching
+                touchcheck = self.TouchPheromone(neighborhoods)
+                lower_boundcheck, upper_boundcheck = self.TouchEdge()
 
-                # ux = rotational_force[0]
-                # uy = rotational_force[1]
+                if np.shape(touchcheck)[0] > 0:
 
-                # # Define problem data
-                # P = sparse.csc_matrix([[1, 0], [0, 1]])
-                # q = np.array([-2*ux, -2*uy])
-                # A = sparse.csc_matrix([[td[0], td[1]],[self.perspective[0], self.perspective[1]]])
-                # l = np.array([cos(self.alpha) - td@self.perspective, 0])
-                # u = np.array([np.inf, 0])
-                # # Create an OSQP object
-                # prob = osqp.OSQP()
+                    chk_l = np.array(touchcheck)[:][:,0]
+                    chk_m = np.array(touchcheck)[:][:,1]
+                    chk_r = np.array(touchcheck)[:][:,2]
 
-                # # Setup workspace and change alpha parameter
-                # prob.setup(P, q, A, l, u, alpha = 1, verbose=False)
+                    if any(chk_l):
 
-                # # Solve problem
-                # res = prob.solve()
-                # ux = res.x[0]; uy = res.x[1]
-                # cl = np.array([ux, uy])
-                # n_p = (self.perspective+coe*cl)/self.norm(self.perspective+coe*cl)
-                # rotational_force = cl
+                        R = np.array([[np.cos(-np.pi), -np.sin(-np.pi)]
+                        ,[np.sin(-np.pi), np.cos(-np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = 2*(delta_persp/self.norm(delta_persp))
+
+                    elif any(chk_r):
+
+                        R = np.array([[np.cos(np.pi), -np.sin(np.pi)]
+                        ,[np.sin(np.pi), np.cos(np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = 2*(delta_persp/self.norm(delta_persp))
+                else:
+
+                    theta = np.random.uniform(-np.pi, np.pi, 1)
+                    delta_persp = np.array([self.R*cos(theta), self.R*sin(theta)])
+                    rotational_force = (delta_persp/self.norm(delta_persp))
+
+                if any(lower_boundcheck[0]) or any(lower_boundcheck[1]) or any(lower_boundcheck[2]):
+
+                    if any(lower_boundcheck[0]):
+
+                        g = 0.5
+                        R = np.array([[np.cos(g*np.pi), -np.sin(g*np.pi)]
+                        ,[np.sin(g*np.pi), np.cos(g*np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = np.sign(1)*(delta_persp/self.norm(delta_persp))
+                        
+                    elif any(upper_boundcheck[1]):
+
+                        delta_persp = -1.5*self.perspective
+                        rotational_force = 2*(delta_persp/self.norm(delta_persp))
+
+                    elif any(lower_boundcheck[2]):
+
+                        g = 0.5
+                        R = np.array([[np.cos(g*np.pi), -np.sin(g*np.pi)]
+                        ,[np.sin(g*np.pi), np.cos(g*np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = np.sign(1)*(delta_persp/self.norm(delta_persp))
+
+                elif any(upper_boundcheck[0]) or any(upper_boundcheck[1]) or any(upper_boundcheck[2]):
+
+                    if any(upper_boundcheck[0]):
+
+                        g = 0.5
+                        R = np.array([[np.cos(g*np.pi), -np.sin(g*np.pi)]
+                        ,[np.sin(g*np.pi), np.cos(g*np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = np.sign(1)*(delta_persp/self.norm(delta_persp))
+                        
+                    elif any(upper_boundcheck[1]):
+
+                        delta_persp = -1.5*self.perspective
+                        rotational_force = 2*(delta_persp/self.norm(delta_persp))
+
+                    elif any(upper_boundcheck[2]):
+
+                        g = 0.5
+                        R = np.array([[np.cos(g*np.pi), -np.sin(g*np.pi)]
+                        ,[np.sin(g*np.pi), np.cos(g*np.pi)]])
+
+                        delta_persp = np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2))[0]
+                        rotational_force = np.sign(1)*(delta_persp/self.norm(delta_persp))
+                else:
+
+                    theta = np.random.uniform(-np.pi, np.pi, 1)
+                    delta_persp = np.array([self.R*cos(theta), self.R*sin(theta)])
+                    rotational_force = (delta_persp/self.norm(delta_persp))
+                        
+                res = translational_force + formation_force
+                return [res, rotational_force]
+
+            elif stage == 2:
+                td = np.asarray(self.targets[self.target_assigned][0]) - self.pos
+                td = td/self.norm(td)
+
+                ux = rotational_force[0]
+                uy = rotational_force[1]
+
+                # Define problem data
+                P = sparse.csc_matrix([[1, 0], [0, 1]])
+                q = np.array([-2*ux, -2*uy])
+                A = sparse.csc_matrix([[td[0], td[1]],[self.perspective[0], self.perspective[1]]])
+                l = np.array([cos(self.alpha) - td@self.perspective, 0])
+                u = np.array([np.inf, 0])
+                # Create an OSQP object
+                prob = osqp.OSQP()
+
+                # Setup workspace and change alpha parameter
+                prob.setup(P, q, A, l, u, alpha = 1, verbose=False)
+
+                # Solve problem
+                res = prob.solve()
+                ux = res.x[0]; uy = res.x[1]
+                cl = np.array([ux, uy])
+                n_p = (self.perspective+coe*cl)/self.norm(self.perspective+coe*cl)
+                rotational_force = cl
                 res = translational_force + formation_force
 
                 return [res, rotational_force]
@@ -142,30 +261,128 @@ class Voronoi2D():
                 res = translational_force + formation_force
                 return [res, rotational_force]
 
+        def polygon_FOV(self):
+
+            range_max = (self.lamb + 1)/(self.lamb)*self.R*cos(self.alpha)
+            R = np.array([[np.cos(self.alpha), -np.sin(self.alpha)]
+                        ,[np.sin(self.alpha), np.cos(self.alpha)]])
+
+            self.top = self.pos + range_max*self.perspective;
+
+            self.ltop = self.pos + range_max*np.reshape(R@np.reshape(self.perspective,(2,1)),(1,2));
+            self.ltop = self.ltop[0]
+
+            self.rtop = self.pos + range_max*np.reshape(np.linalg.inv(R)@np.reshape(self.perspective,(2,1)),(1,2));
+            self.rtop = self.rtop[0]
+
+            # Pheromone Storag
+            weight = 20
+            decay = 0.5
+            phe_pos = np.array([[self.pos, self.ltop, self.top, self.rtop, weight]], dtype = "object")
+
+            if np.shape(self.phe)[0] < 1:
+
+                self.phe = phe_pos
+
+            elif np.shape(self.phe)[0] >= 1 and np.shape(self.phe)[0] < weight/decay:
+
+                self.phe[:, np.shape(self.phe)[1]-1] -= decay
+
+                self.phe = np.append(self.phe, phe_pos, 0)
+
+            else:
+
+                self.phe[:, np.shape(self.phe)[1]-1] -= 1
+
+                if self.phe[0,4] == 0:
+
+                    self.phe = np.delete(self.phe, 0, 0)
+                    self.phe = np.append(self.phe, phe_pos, 0)
+
+        #  Perspective Selection
+        def TouchPheromone(self, neighborhoods):
+
+            gemos = np.array([Point(self.ltop), Point(self.top), Point(self.rtop)])
+            checklist = []
+
+            for neighbor in neighborhoods:
+
+                for pheromone in neighbor.phe[::-1]:
+
+                    pt = list(pheromone[0:4])
+                    pt.append(pheromone[0])
+                    polygon = Polygon(pt)
+
+                    if polygon.is_valid:
+
+                        # print(Polygon.contains(polygon, gemos))
+                        # print("id: " + str(self.id) + \
+                        #         " touch neighbor: " + str(neighbor.id) + " FOV" + "\n")
+                        checklist.append(Polygon.contains(polygon, gemos))
+
+                        break
+            return checklist
+
+                # if np.shape(neighborhoods[i].phe)[0] == 1:
+
+                #     pt = list(np.array_split(neighborhoods[i].phe,1,1)[0][0][0:4])
+                #     pt.append(np.array_split(neighborhoods[i].phe,1,1)[0][0][0])
+                #     polygon = Polygon(pt)
+                # else:
+
+                #     pt = []
+                #     pt.append(np.array_split(self.phe,1,1)[0][0][0])
+                #     pt.extend(list(np.array_split(self.phe,1,1)[0][:,1]))
+                #     pt.append(np.array_split(self.phe,1,1)[0][np.shape(self.phe)[0]-1][2])
+                #     pt.extend(list(np.array_split(self.phe,1,1)[0][:,3]))
+                #     pt.append(np.array_split(self.phe,1,1)[0][0][0])
+                #     polygon = Polygon(pt)
+
+                # checklist.append(Polygon.contains(polygon, gemos))
+
+        def TouchEdge(self):
+
+            gemos = np.array([self.ltop, self.top, self.rtop])
+            lower_bound = np.array([0,0])
+            upper_bound = np.array([22,22])
+
+            return np.less_equal(gemos, lower_bound), np.greater_equal(gemos, upper_bound) 
+
+        def TargetFound(self, neighborhoods):
+
+            if any([neighborhoods[i].found for i in range(len(neighborhoods))]):
+
+                self.found = True
+            else:
+
+                pt = [self.pos, self.ltop, self.top, self.rtop, self.pos]
+                tg = Point(self.targets[0][0])
+                polygon = Polygon(pt)
+
+                if polygon.is_valid and Polygon.contains(polygon, tg):
+
+                    self.found = True
+
         def TargetAssignment(self):
             score = -np.inf
             self.target_assigned = -1
             pos = None
-
             for (target,i) in zip(self.targets,range(0,len(self.targets))):
                 q_res = self.ResolutionQuality(target[0][0], target[0][1])
                 q_per = self.PerspectiveQuality(target[0][0], target[0][1])
                 tmp = q_res*q_per if q_res > 0 and q_per > 0 else 0
                 if tmp > score and tmp > 0:
                     score = tmp
-                    pos = (np.asarray(target[0])/self.grid_size).astype(np.int64)
+                    pos = target[0]
                     self.target_assigned = i
-
-            if pos is not None and np.any(np.all(pos == np.column_stack((self.voronoi[1],self.voronoi[0])), axis=1)):
+                    self.stage = 1
+            
+            if np.any(np.all(pos == self.voronoi.reshape(2,-1))):
                 self.stage = 2
-            else:
-                self.stage = 1
 
-            print(self.id,"=>", self.target_assigned, "=>", score, "=>", self.stage)
+            print(self.id,"=>", self.target_assigned, "=>", score)
 
         def FormationControl(self, neighbors):
-            # TO-DO after Chinese New Year
-            # Consider which neighbor is sharing the same target and only use them to obtain formation force
             neighbor_force = np.array([0.,0.])
             for neighbor_pos in neighbors:
                 neighbor_force += (self.pos - neighbor_pos)/(self.norm(self.pos - neighbor_pos))
@@ -201,7 +418,6 @@ class Voronoi2D():
                 for i in range(len(self.voronoi[0])):
                     x_map = self.voronoi[1][i]
                     y_map = self.voronoi[0][i]
-
                     x, y = x_map*self.grid_size[0], y_map*self.grid_size[1]
                     x_p = np.array([x,y]) - self.pos
                     norm = self.norm(x_p)
@@ -302,21 +518,16 @@ class Voronoi2D():
                             max(int((self.pos[0] - range_max)/self.grid_size[0]), 0):\
                                 min(int((self.pos[0] + range_max)/self.grid_size[0]), self.size[0])]\
                                     = quality_map
-
-        def UpdateVoronoi(self, FoVs):
-            if self.stage == 1:
-                self.event = self.event_density(self.event, self.targets, self.grid_size) 
-                self.event_plt = ((self.event - self.event.min()) * (1/(self.event.max() - self.event.min()) * 255)).astype('uint8')
-            elif self.stage == 2:
-                self.event = self.event_density(self.event, [self.targets[self.target_assigned]], self.grid_size) 
-                self.event_plt = ((self.event - self.event.min()) * (1/(self.event.max() - self.event.min()) * 255)).astype('uint8')
             
+            
+
+        def UpdateVoronoi(self, FoVs, event):
             quality_map = self.FoV
             for FoV in FoVs:
                 quality_map = np.where((quality_map > FoV), quality_map, 0)
 
-            self.quality = np.sum(quality_map*self.event)
-            self.voronoi = np.array(np.where((quality_map != 0) & (self.FoV != 0)))
+            self.quality = np.sum(quality_map*event)
+            self.voronoi = np.array(np.where(quality_map != 0))
             self.overlap = np.array(np.where((quality_map == 0) & (self.FoV != 0)))
             self.map_plt = np.array(np.where(quality_map != 0, self.id + 1, 0))
 
@@ -325,18 +536,6 @@ class Voronoi2D():
             for i in range(len(arr)):
                 sum += arr[i]**2
             return sqrt(sum)
-
-        def event_density(self, event, target, grid_size):
-            x = np.arange(event.shape[0])*grid_size[0]
-            for y_map in range(0, event.shape[1]):
-                y = y_map*grid_size[1]
-                density = 0
-                for i in range(len(target)):
-                    density += target[i][2]*np.exp(-target[i][1]*np.linalg.norm(np.array([x,y], dtype=object)\
-                                    -np.array((target[i][0][1],target[i][0][0]))))
-                event[:][y_map] = density
-
-            return 0 + event 
 
     class Map():
         def __init__(self, map_size, grid_size):
@@ -352,7 +551,7 @@ class Voronoi2D():
                     pygame.draw.rect(self.display, (125,125,125), rect, 1)
             pygame.display.update()
 
-        def Update(self, map_plt, cameras, event, targets):
+        def Update(self, map_plt, cameras, event):
             x_map = 0
             for x in range(0, self.window_size[0], self.blockSize):
                 y_map = 0
@@ -373,15 +572,22 @@ class Voronoi2D():
                     y_map += 1
                 x_map += 1 
 
+            # for camera in cameras:
+
+            #     color = (camera.color[0]*0.5, camera.color[1]*0.5, camera.color[2]*0.5)
+            #     pygame.draw.polygon(self.display, color, [camera.pos/self.grid_size*self.blockSize, \
+            #                                                 camera.ltop/self.grid_size*self.blockSize, \
+            #                                                 camera.top/self.grid_size*self.blockSize, \
+            #                                                 camera.rtop/self.grid_size*self.blockSize], 2)
+
             for camera in cameras:
                 color = (camera.color[0], camera.color[1], camera.color[2])
-                center = camera.pos/self.grid_size*self.blockSize
-
-                R = camera.R*cos(camera.alpha)/self.grid_size[0]*self.blockSize
-                pygame.draw.line(self.display, color, center, center + camera.perspective*R, 3)
                 pygame.draw.circle(self.display, color, camera.pos/self.grid_size*self.blockSize, 10)
-
-            for target in targets:
+            #     for target in (camera.targets):
+            #         pygame.draw.circle(self.display, color, np.asarray(target[0])/self.grid_size*self.blockSize ,\
+            #                             camera.r/self.grid_size[0]*self.blockSize, width=2)
+            
+            for target in cameras[0].targets:
                 pygame.draw.circle(self.display, (0,0,0), np.asarray(target[0])/self.grid_size\
                                     *self.blockSize, 3)
             pygame.draw.rect(self.display, (0, 0, 0), (0, 0, map_size[0]/grid_size[0]*self.blockSize, \
@@ -410,7 +616,7 @@ def dynamicTarget(x, y):
     dx = np.random.uniform(-0.5, 0.5, 1)
     dy = np.random.uniform(-0.5, 0.5, 1)
 
-    return (x, y)#(np.round(float(np.clip(dx/2 + x, 0, 24)),1), np.round(float(np.clip(dy/2 + y, 0, 24)),1))
+    return (float(np.clip(dx/3 + x, 0, 24)), float(np.clip(dy/3 + y, 0, 24)))
 
 if __name__ == "__main__":
     pygame.init()
@@ -423,84 +629,110 @@ if __name__ == "__main__":
                 'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
                 'perspective'   :  np.array([0.9,1]),
                 'AngleofView'   :  20,
-                'range_limit'   :  5,
+                'range_limit'   :  4,
                 'lambda'        :  2,
                 'color'         : (200, 0, 0)}
 
     cameras.append(camera0)
 
-    # camera1 = { 'id'            :  1,
-    #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
-    #             'perspective'   :  np.array([0.7,1]),
-    #             'AngleofView'   :  20,
-    #             'range_limit'   :  5,
-    #             'lambda'        :  2,
-    #             'color'         : (0, 200, 0)}
+    camera1 = { 'id'            :  1,
+                'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
+                'perspective'   :  np.array([0.7,1]),
+                'AngleofView'   :  20,
+                'range_limit'   :  4,
+                'lambda'        :  2,
+                'color'         : (0, 200, 0)}
 
-    # cameras.append(camera1)
+    cameras.append(camera1)
 
-    # camera2 = { 'id'            :  2,
-    #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
-    #             'perspective'   :  np.array([0.7,1]),
-    #             'AngleofView'   :  20,
-    #             'range_limit'   :  5,
-    #             'lambda'        :  2,
-    #             'color'         : (150, 100, 200)}
+    camera2 = { 'id'            :  2,
+                'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
+                'perspective'   :  np.array([0.7,1]),
+                'AngleofView'   :  20,
+                'range_limit'   :  5,
+                'lambda'        :  2,
+                'color'         : (0, 0, 200)}
 
-    # cameras.append(camera2)
+    cameras.append(camera2)
 
     # camera3 = { 'id'            :  3,
     #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
-    #             'perspective'   :  np.array([0,1]),
+    #             'perspective'   :  np.array([0.9,1]),
     #             'AngleofView'   :  20,
     #             'range_limit'   :  5,
-    #             'lambda'        :  2,
-    #             'color'         : (0, 100, 200)}
+    #             'lambda'        :  5,
+    #             'color'         : (200, 200, 0)}
 
     # cameras.append(camera3)
 
     # camera4 = { 'id'            :  4,
     #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
+    #             'perspective'   :  np.array([0.7,1]),
+    #             'AngleofView'   :  20,
+    #             'range_limit'   :  5,
+    #             'lambda'        :  5,
+    #             'color'         : (0, 200, 200)}
+
+    # cameras.append(camera4)
+
+    # camera5 = { 'id'            :  5,
+    #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
     #             'perspective'   :  np.array([0,1]),
     #             'AngleofView'   :  20,
     #             'range_limit'   :  5,
-    #             'lambda'        :  2,
-    #             'color'         : (175, 150, 0)}
+    #             'lambda'        :  5,
+    #             'color'         : (200, 0, 200)}
 
-    # cameras.append(camera4)
+    # cameras.append(camera5)
+
+    # camera6 = { 'id'            :  6,
+    #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
+    #             'perspective'   :  np.array([-1,0]),
+    #             'AngleofView'   :  20,
+    #             'range_limit'   :  5,
+    #             'lambda'        :  5,
+    #             'color'         : (100, 100, 200)}
+
+    # cameras.append(camera6)
+
+    # camera7 = { 'id'            :  7,
+    #             'position'      :  np.array([np.random.uniform(0.5,22), np.random.uniform(0.5,22)]),
+    #             'perspective'   :  np.array([0,-1]),
+    #             'AngleofView'   :  20,
+    #             'range_limit'   :  5,
+    #             'lambda'        :  5,
+    #             'color'         : (200, 100, 100)}
+
+    # cameras.append(camera7)
 
     size = (np.array(map_size) / np.array(grid_size)).astype(np.int64)
     event = np.zeros((size[0], size[1]))
 
-    target = [[(15, 15), 1, 10], [(17, 17), 1, 10], [(13, 13), 1, 10]] #target, certainty
+    target = [[(5, 5), 1, 10], [(17, 17), 1, 10], [(5, 17), 1, 10]] #target, certainty
     event1 = event_density(event, target, grid_size)    
     event_plt1 = ((event1 - event1.min()) * (1/(event1.max() - event1.min()) * 255)).astype('uint8')
 
     voronoi = Voronoi2D(map_size, grid_size, len(cameras), cameras, np.ones(size), np.ones(size), target)
 
     Done = False
+    found = True
     start = time()
-    cnt = [0 for i in range(len(target))]    
+    cnt = [0 for i in range(len(target))]
     while not Done:
         #last = time()
         for op in pygame.event.get():
             if op.type == pygame.QUIT:
                 Done = True
-        event = np.zeros((size[0], size[1]))
-        # for i in range(len(target)):
-        #     if i == np.argmax(cnt) and cnt[i] != 0:
-        #         target[i][2] -= 0.5
-        #         target[i][2] = np.clip(target[i][2], 1e-10, 100)
-        #     elif i == np.argmin(cnt) or cnt[i] == 0:
-        #         target[i][2] += 0.5
-        #         target[i][2] = np.clip(target[i][2], 1e-10, 100)
-
-        target = [[dynamicTarget(target[0][0][0], target[0][0][1]), 1, target[0][2]]]#,
-                   # [dynamicTarget(target[1][0][0], target[1][0][1]), 1, target[1][2]],
-                        # [dynamicTarget(target[2][0][0], target[2][0][1]), 1, target[2][2]]]
-        event1 = event_density(event, target, grid_size) 
-        event_plt1 = ((event - event1.min()) * (1/(event1.max() - event1.min()) * 255)).astype('uint8')
-        cnt = voronoi.Update(event_plt=event_plt1, target=target, step = 0.1)
+        if not found:
+            found, cnt = voronoi.Update()
+        else:
+            event = np.zeros((size[0], size[1]))
+            target = [[dynamicTarget(target[0][0][0], target[0][0][1]), 1, target[0][2]],
+                        [dynamicTarget(target[1][0][0], target[1][0][1]), 1, target[1][2]],
+                            [dynamicTarget(target[2][0][0], target[2][0][1]), 1, target[2][2]]]
+            event1 = event_density(event, target, grid_size) 
+            event_plt1 = ((event - event1.min()) * (1/(event1.max() - event1.min()) * 255)).astype('uint8')
+            found, cnt = voronoi.Update(event = event1, event_plt = event_plt1, target=target)
 
         print("===================", cnt, "====================")
         #print(time() - last)
