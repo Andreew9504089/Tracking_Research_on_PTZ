@@ -175,9 +175,7 @@ class Voronoi2D():
                 self.stage = 2
             else:
                 self.stage = 1
-
-            # print(self.id,"=>", self.target_assigned, "=>", score, "=>", self.stage)
-
+                
         def FormationControl(self, neighbors):
             # TO-DO after Chinese New Year
             # Consider which neighbor is sharing the same target and only use them to obtain formation force

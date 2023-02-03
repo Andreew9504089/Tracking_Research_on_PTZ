@@ -357,7 +357,6 @@ class Voronoi2D():
 
             return 0 + event 
 
-        def globalVoronoi(self, event, target)
     class Map():
         def __init__(self, map_size, grid_size):
             self.size = (np.array(map_size) / np.array(grid_size)).astype(np.int64)
